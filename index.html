@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title> Pixel Art — Made by BigStrib</title>
+<title>Pixel Art — Finite Canvas + Layers + Right-Side Colors</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -38,8 +38,8 @@
     background: var(--btn); color: var(--text); border: 1px solid var(--border);
     padding: 6px 10px; border-radius: 6px; cursor: pointer;
   }
-  /* No hover overlay for swatches */
   button:hover:not(.swatch) { background: var(--btn-hover); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
 
   .btn-accent { border-color: #437fff77; box-shadow: inset 0 0 0 1px #437fff44; }
   .btn-ok { border-color: #2ecc7166; }
@@ -127,9 +127,7 @@
     outline: 1px solid var(--border); outline-offset: 0;
     transition: outline-color .15s ease, outline-width .15s ease, outline-offset .15s ease;
   }
-  /* Keep swatch color; no overlay on hover/active/focus */
   .swatch:hover, .swatch:active, .swatch:focus { background: var(--c); }
-  /* Outline-only highlight */
   .swatch:hover, .swatch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .swatch:focus { outline: none; }
 
@@ -162,19 +160,25 @@
 </head>
 <body>
   <header>
-    <div class="title">🖌️
- Pixel Art — Made by BigStrib</div>
+    <div class="title">🧩 Pixel Art — Finite Canvas + Layers</div>
+
     <div class="row">
       <span class="tag">Project</span>
       <input id="projectName" type="text" placeholder="Untitled" />
       <label class="small"><input id="autosave" type="checkbox" checked /> Autosave</label>
     </div>
+
     <div class="row">
+      <!-- Undo / Redo -->
+      <button id="undoBtn" title="Undo (Ctrl/Cmd+Z)">↶</button>
+      <button id="redoBtn" title="Redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z)">↷</button>
+
       <button id="newProject" title="New project (clears canvas)">New</button>
       <button id="saveFile" class="btn-ok" title="Save to a .pxa file">Save</button>
       <button id="loadFileBtn" title="Load a .pxa file">Load</button>
       <input id="openFile" type="file" accept=".pxa,application/json" style="display:none" />
     </div>
+
     <div class="row">
       <button id="exportPNG" class="btn-accent" title="Export full canvas to PNG">Export PNG</button>
       <span id="status" class="hint small">Ready</span>
@@ -285,6 +289,10 @@
     isDrawing: false, isPanning: false, spaceHeld: false, lastCell: null, dragErase: false, panLastPx: 0, panLastPy: 0,
     // UI
     colorsCollapsed: false,
+    // history
+    history: [], future: [], historyLimit: 50,
+    // click fallback guard (fix double-undo on first stroke)
+    hadPointerDown: false,
   };
 
   // ====== Elements ======
@@ -329,6 +337,10 @@
     openFile: document.getElementById('openFile'),
     exportPNG: document.getElementById('exportPNG'),
 
+    // undo/redo
+    undoBtn: document.getElementById('undoBtn'),
+    redoBtn: document.getElementById('redoBtn'),
+
     // misc
     status: document.getElementById('status'),
     coords: document.getElementById('coords'),
@@ -340,7 +352,7 @@
     pzLabel: document.getElementById('previewZoomLabel'),
   };
 
-  // ====== Utils ======
+  // ====== Utils / History ======
   const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
   const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
   function setStatus(msg, ms=1200) {
@@ -350,12 +362,116 @@
       setStatus._t = setTimeout(()=>{ el.status.textContent = 'Ready'; }, ms);
     }
   }
-  function normalizeHex(input) {
-    if (!input) return null;
-    let s = String(input).trim().replace(/^0x/i, '').replace(/^#/, '');
-    if (s.length === 3) s = s.split('').map(ch => ch + ch).join('');
-    if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
-    return '#' + s.toLowerCase();
+
+  function updateUndoRedoUI() {
+    el.undoBtn.disabled = state.history.length === 0;
+    el.redoBtn.disabled = state.future.length === 0;
+  }
+
+  function exportProjectObject() {
+    const layers = state.layers.map(l => ({
+      id: l.id,
+      name: l.name,
+      visible: l.visible,
+      locked: !!l.locked,
+      png: l.off.toDataURL('image/png'),
+    }));
+    return {
+      version: 8,
+      cols: state.cols,
+      rows: state.rows,
+      palette: state.palette,
+      layers,
+      activeLayerId: state.activeLayerId,
+      projectName: state.projectName,
+      background: { transparent: state.transparentBG, color: state.bgColor },
+    };
+  }
+
+  async function importProjectObject(obj, opts={}) {
+    if (!obj || typeof obj !== 'object') throw new Error('Invalid project file');
+
+    const fromHistory = !!opts.fromHistory;
+
+    const oldCols = state.cols, oldRows = state.rows;
+
+    state.cols = clamp(parseInt(obj.cols||32,10), 4, 512);
+    state.rows = clamp(parseInt(obj.rows||32,10), 4, 512);
+    el.cols.value = state.cols;
+    el.rows.value = state.rows;
+
+    state.palette = Array.isArray(obj.palette) ? obj.palette : state.palette;
+
+    state.projectName = obj.projectName || '';
+    el.projectName.value = state.projectName;
+
+    if (obj.background) {
+      state.transparentBG = !!obj.background.transparent;
+      state.bgColor = obj.background.color || state.bgColor;
+      el.transparentBG.checked = state.transparentBG;
+      el.bgColor.value = state.bgColor;
+    }
+
+    // rebuild layers
+    state.layers = [];
+    for (const L of obj.layers || []) {
+      const layer = createLayer(L.name);
+      layer.id = L.id || uid();
+      layer.visible = L.visible !== false;
+      layer.locked = !!L.locked;
+      await drawImageURLToCanvas(L.png, layer.offCtx);
+      state.layers.push(layer);
+    }
+    state.activeLayerId = obj.activeLayerId || (state.layers[state.layers.length - 1]?.id || null);
+
+    ensureActiveLayer();
+    renderPalette();
+    renderLayersPanel();
+    if (!fromHistory || oldCols !== state.cols || oldRows !== state.rows) {
+      centerAndFit();
+    }
+    draw();
+  }
+
+  function pushHistory(label='') {
+    const snapshot = exportProjectObject();
+    state.history.push(snapshot);
+    if (state.history.length > state.historyLimit) state.history.shift();
+    state.future.length = 0; // clear redo on new action
+    updateUndoRedoUI();
+  }
+
+  async function undo() {
+    if (!state.history.length) return;
+    const current = exportProjectObject();
+    const prev = state.history.pop();
+    state.future.push(current);
+    updateUndoRedoUI();
+    await importProjectObject(prev, { fromHistory: true });
+    draw();
+    setStatus('Undid');
+    autosaveMaybe.debounce();
+  }
+
+  async function redo() {
+    if (!state.future.length) return;
+    const current = exportProjectObject();
+    const next = state.future.pop();
+    state.history.push(current);
+    updateUndoRedoUI();
+    await importProjectObject(next, { fromHistory: true });
+    draw();
+    setStatus('Redid');
+    autosaveMaybe.debounce();
+  }
+
+  function drawImageURLToCanvas(url, ctx) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => { ctx.clearRect(0,0,ctx.canvas.width, ctx.canvas.height); ctx.drawImage(img, 0, 0); resolve(); };
+      img.onerror = reject;
+      img.src = url;
+    });
   }
 
   const autosaveMaybe = (() => {
@@ -386,6 +502,7 @@
     return { id: uid(), name: name || `Layer ${state.layers.length + 1}`, visible: true, locked: false, off, offCtx, preview: null };
   }
   function addLayer(name) {
+    pushHistory('addLayer');
     const layer = createLayer(name);
     state.layers.push(layer);
     state.activeLayerId = layer.id;
@@ -403,6 +520,7 @@
   }
   function removeLayer(id) {
     if (state.layers.length <= 1) { alert('Need at least one layer.'); return; }
+    pushHistory('removeLayer');
     const idx = state.layers.findIndex(l => l.id === id);
     if (idx >= 0) {
       state.layers.splice(idx, 1);
@@ -419,6 +537,7 @@
     if (idx < 0) return;
     const swapIdx = dir === 'up' ? idx + 1 : idx - 1;
     if (swapIdx < 0 || swapIdx >= state.layers.length) return;
+    pushHistory('moveLayer');
     const [l] = state.layers.splice(idx, 1);
     state.layers.splice(swapIdx, 0, l);
     renderLayersPanel();
@@ -428,6 +547,7 @@
   function renameLayer(id, name) {
     const layer = state.layers.find(l => l.id === id);
     if (!layer) return;
+    pushHistory('renameLayer');
     layer.name = name || layer.name;
     renderLayersPanel();
     autosaveMaybe();
@@ -435,6 +555,7 @@
   function toggleLayerVisibility(id) {
     const layer = state.layers.find(l => l.id === id);
     if (!layer) return;
+    pushHistory('toggleVis');
     layer.visible = !layer.visible;
     renderLayersPanel();
     draw();
@@ -443,6 +564,7 @@
   function toggleLayerLock(id) {
     const layer = state.layers.find(l => l.id === id);
     if (!layer) return;
+    pushHistory('toggleLock');
     layer.locked = !layer.locked;
     renderLayersPanel();
     setStatus(layer.locked ? 'Layer locked 🔒' : 'Layer unlocked 🔓');
@@ -612,7 +734,7 @@
   }
   function hidePreviewZoom() { el.previewZoom.style.display = 'none'; }
 
-  // ====== Layers UI ======
+  // ====== Layers UI (rename + drag) ======
   function makeNameSpan(layer) {
     const span = document.createElement('span');
     span.className = 'name';
@@ -661,6 +783,7 @@
     if (srcIdx < 0 || srcIdx >= disp.length) return;
     let d = destIdx;
     if (d > disp.length) d = disp.length;
+    pushHistory('reorderLayers');
     const [moved] = disp.splice(srcIdx, 1);
     if (d > srcIdx) d -= 1; // account for removal
     disp.splice(d, 0, moved);
@@ -830,24 +953,30 @@
     const vw = rect.width, vh = rect.height;
     const cx = clamp(canvasPxX, 0, vw);
     const cy = clamp(canvasPxY, 0, vh);
+
     const worldX = state.offsetX + cx / state.cellSize;
     const worldY = state.offsetY + cy / state.cellSize;
+
     const newSize = clamp(Math.round(state.cellSize * factor), state.minCellSize, state.maxCellSize);
     if (newSize === state.cellSize) return;
     state.cellSize = newSize;
+
     state.offsetX = worldX - cx / state.cellSize;
     state.offsetY = worldY - cy / state.cellSize;
+
     draw();
   }
+
   function handleWheel(ev) {
     ev.preventDefault();
     const rect = el.canvas.getBoundingClientRect();
     const px = ev.clientX - rect.left;
     const py = ev.clientY - rect.top;
-    const intensity = 0.0015;
+    const intensity = 0.0015; // zoom sensitivity
     const factor = Math.exp(-ev.deltaY * intensity);
     zoomAtCanvasPx(px, py, factor);
   }
+
   function startPan(ev) {
     state.isPanning = true;
     el.canvas.classList.add('grabbing');
@@ -867,77 +996,10 @@
   function endPan() {
     state.isPanning = false;
     el.canvas.classList.remove('grabbing');
+    setTimeout(() => { state.hadPointerDown = false; }, 0);
   }
 
   // ====== Save/Load (Local file) ======
-  function exportProjectObject() {
-    const layers = state.layers.map(l => ({
-      id: l.id,
-      name: l.name,
-      visible: l.visible,
-      locked: !!l.locked,
-      png: l.off.toDataURL('image/png'),
-    }));
-    return {
-      version: 7,
-      cols: state.cols,
-      rows: state.rows,
-      palette: state.palette,
-      layers,
-      activeLayerId: state.activeLayerId,
-      projectName: state.projectName,
-      background: { transparent: state.transparentBG, color: state.bgColor },
-    };
-  }
-
-  async function importProjectObject(obj) {
-    if (!obj || typeof obj !== 'object') throw new Error('Invalid project file');
-
-    state.cols = clamp(parseInt(obj.cols||32,10), 4, 512);
-    state.rows = clamp(parseInt(obj.rows||32,10), 4, 512);
-    el.cols.value = state.cols;
-    el.rows.value = state.rows;
-
-    state.palette = Array.isArray(obj.palette) ? obj.palette : state.palette;
-
-    state.projectName = obj.projectName || '';
-    el.projectName.value = state.projectName;
-
-    if (obj.background) {
-      state.transparentBG = !!obj.background.transparent;
-      state.bgColor = obj.background.color || state.bgColor;
-      el.transparentBG.checked = state.transparentBG;
-      el.bgColor.value = state.bgColor;
-    }
-
-    // rebuild layers
-    state.layers = [];
-    for (const L of obj.layers || []) {
-      const layer = createLayer(L.name);
-      layer.id = L.id || uid();
-      layer.visible = L.visible !== false;
-      layer.locked = !!L.locked;
-      await drawImageURLToCanvas(L.png, layer.offCtx);
-      state.layers.push(layer);
-    }
-    state.activeLayerId = obj.activeLayerId || (state.layers[state.layers.length - 1]?.id || null);
-
-    ensureActiveLayer();
-    renderPalette();
-    renderLayersPanel();
-    centerAndFit();
-    draw();
-  }
-
-  function drawImageURLToCanvas(url, ctx) {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => { ctx.clearRect(0,0,ctx.canvas.width, ctx.canvas.height); ctx.drawImage(img, 0, 0); resolve(); };
-      img.onerror = reject;
-      img.src = url;
-    });
-  }
-
   function saveToFile() {
     const obj = exportProjectObject();
     const json = JSON.stringify(obj);
@@ -950,12 +1012,16 @@
     URL.revokeObjectURL(a.href);
     setStatus('Saved to file ✔');
   }
+
   function loadFromFile(file) {
     const reader = new FileReader();
     reader.onload = async () => {
       try {
         const obj = JSON.parse(reader.result);
         await importProjectObject(obj);
+        state.history.length = 0;
+        state.future.length = 0;
+        updateUndoRedoUI();
         setStatus(`Loaded "${file.name}"`);
       } catch (e) {
         alert('Could not read project file. Is it a valid .pxa JSON?');
@@ -1018,6 +1084,10 @@
 
   // ====== Events ======
   function bindEvents() {
+    // Undo / Redo buttons
+    el.undoBtn.addEventListener('click', () => undo());
+    el.redoBtn.addEventListener('click', () => redo());
+
     // Tools
     el.toolPencil.addEventListener('click', () => setTool('pencil'));
     el.toolEraser.addEventListener('click', () => setTool('eraser'));
@@ -1025,13 +1095,27 @@
 
     // Shortcuts
     window.addEventListener('keydown', (e) => {
-      if (['INPUT','TEXTAREA'].includes((document.activeElement?.tagName)||'')) {
+      const inInput = ['INPUT','TEXTAREA'].includes((document.activeElement?.tagName)||'');
+      const meta = e.ctrlKey || e.metaKey;
+
+      // Global undo/redo
+      if (meta && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redo(); else undo();
+        return;
+      }
+      if (meta && e.key.toLowerCase() === 'y') {
+        e.preventDefault(); redo(); return;
+      }
+
+      if (inInput) {
         if (e.key === 'Enter' && document.activeElement === el.hexInput) {
           e.preventDefault();
           addColorToPalette(el.hexInput.value || el.color.value);
         }
         return;
       }
+
       if (e.code === 'Space') { state.spaceHeld = true; el.canvas.classList.add('grabbing'); e.preventDefault(); }
       if (e.key === 'p' || e.key === 'P') setTool('pencil');
       if (e.key === 'e' || e.key === 'E') setTool('eraser');
@@ -1072,6 +1156,7 @@
       const rows = clamp(parseInt(el.rows.value, 10), 4, 512);
       if (cols === state.cols && rows === state.rows) return;
       if (!confirm('Apply new size? This creates a new blank canvas (save first if needed).')) return;
+      pushHistory('resizeCanvas');
       initProject(cols, rows);
       setStatus('Canvas resized');
     });
@@ -1080,15 +1165,27 @@
     // Layers
     el.addLayer.addEventListener('click', () => addLayer());
 
-    // Canvas pointer (paint/erase/pan)
+    // Canvas pointer (paint/erase/pan) + history per stroke
     el.canvas.addEventListener('pointerdown', (ev) => {
+      state.hadPointerDown = true; // guard to avoid duplicate click fallback
+
       if (ev.button === 1 || state.spaceHeld) { startPan(ev); return; }
+
+      // Prepare history for painting/erasing strokes (once per stroke)
+      if ((ev.button === 0 && (state.tool === 'pencil' || state.tool === 'eraser')) || ev.button === 2) {
+        const layer = getActiveLayer();
+        if (layer && !layer.locked) pushHistory('stroke');
+      }
+
+      // right => erase
       if (ev.button === 2) {
         el.canvas.setPointerCapture(ev.pointerId);
         state.isDrawing = true; state.dragErase = true;
         const { x, y } = worldCellFromEvent(ev); state.lastCell = `${x},${y}`;
         paintAt(x, y, 'erase'); return;
       }
+
+      // left => draw with tool
       if (ev.button === 0) {
         el.canvas.setPointerCapture(ev.pointerId);
         state.isDrawing = true; state.dragErase = false;
@@ -1109,14 +1206,23 @@
         paintAt(x, y, state.dragErase ? 'erase' : null);
       }
     });
-    const stopDraw = () => { state.isDrawing = false; state.dragErase = false; state.lastCell = null; };
+    const stopDraw = () => {
+      state.isDrawing = false; state.dragErase = false; state.lastCell = null;
+      setTimeout(() => { state.hadPointerDown = false; }, 0);
+    };
     el.canvas.addEventListener('pointerup', (ev) => { if (state.isPanning) endPan(); else stopDraw(); });
     el.canvas.addEventListener('pointercancel', () => { if (state.isPanning) endPan(); else stopDraw(); });
     el.canvas.addEventListener('pointerleave', () => { if (state.isPanning) endPan(); else stopDraw(); });
 
-    // Click fallback to ensure single click paints
+    // Click fallback: only if no pointerdown handled this interaction
     el.canvas.addEventListener('click', (ev) => {
       if (state.isPanning) return;
+      if (state.hadPointerDown) return; // pointer flow already handled it
+
+      if (state.tool === 'pencil' || state.tool === 'eraser') {
+        const layer = getActiveLayer();
+        if (layer && !layer.locked) pushHistory('stroke');
+      }
       const { x, y } = worldCellFromEvent(ev);
       paintAt(x, y, null);
     });
@@ -1134,6 +1240,7 @@
     // New / Save file / Load file / Export
     el.newProject.addEventListener('click', () => {
       if (!confirm('Create a new project? This clears the canvas (save first if needed).')) return;
+      pushHistory('newProject');
       initProject(state.cols, state.rows);
       setStatus('New project');
     });
@@ -1161,6 +1268,13 @@
     state.color = h;
     el.color.value = h;
     el.hexInput.value = h.toUpperCase();
+  }
+  function normalizeHex(input) {
+    if (!input) return null;
+    let s = String(input).trim().replace(/^0x/i, '').replace(/^#/, '');
+    if (s.length === 3) s = s.split('').map(ch => ch + ch).join('');
+    if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+    return '#' + s.toLowerCase();
   }
   function addColorToPalette(hex) {
     const h = normalizeHex(hex);
@@ -1230,6 +1344,11 @@
 
     resizeViewCanvas();
     initProject(state.cols, state.rows);
+    // Reset initial history (fresh session)
+    state.history.length = 0;
+    state.future.length = 0;
+    updateUndoRedoUI();
+
     setStatus('Ready');
   }
 
