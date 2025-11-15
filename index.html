@@ -94,6 +94,7 @@
     display: block; 
     background: transparent; 
     image-rendering: pixelated;
+    image-rendering: crisp-edges;
     cursor: crosshair; 
     touch-action: none; 
     user-select: none;
@@ -155,6 +156,7 @@
   .preview {
     width: 20px; height: 20px; border: 1px solid var(--border); border-radius: 3px;
     image-rendering: pixelated;
+    image-rendering: crisp-edges;
     background:
       conic-gradient(#0000 90deg, #000 0) 0 0/8px 8px,
       conic-gradient(#0000 90deg, #000 0) 4px 4px/8px 8px,
@@ -269,13 +271,18 @@
     box-shadow: 0 8px 24px rgba(0,0,0,.55);
     color: var(--text);
   }
-  .preview-zoom canvas { display: block; image-rendering: pixelated; }
+  .preview-zoom canvas { 
+    display: block; 
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    image-rendering: -moz-crisp-edges;
+  }
   .preview-zoom .label { margin-top: 4px; font-size: 11px; color: var(--muted); text-align: center; }
 </style>
 </head>
 <body>
   <header>
-    <div class="title">🧩 Pixel Art — Finite Canvas + Layers</div>
+    <div class="title">🧩 Pixel Art — By BigStrib</div>
 
     <div class="row">
       <span class="tag">Project</span>
@@ -343,7 +350,7 @@
       <div class="panel">
         <div class="panel-head">
           <span class="tag">Canvas</span>
-          <span class="hint small">Size in cells (cols × rows)</span>
+          <span class="hint small"></span>
         </div>
         <div class="row" style="margin-top:8px">
           <input id="cols" type="number" min="4" max="512" value="32" />
@@ -366,7 +373,6 @@
         <span>
           Wheel to zoom. Left-drag or click to paint. Right-drag to erase. Middle-drag or hold <span class="kbd">Space</span> to pan.
           Tools: <span class="kbd">P</span>/<span class="kbd">E</span>/<span class="kbd">I</span>. Press <span class="kbd">0</span> to reset/fit.
-          Tip: Shift+click <em>Export PNG</em> to choose a scale.
         </span>
       </div>
     </div>
@@ -413,7 +419,7 @@
   const el = {
     wrap: document.getElementById('canvasWrap'),
     canvas: document.getElementById('view'),
-    ctx: document.getElementById('view').getContext('2d'),
+    ctx: document.getElementById('view').getContext('2d', { willReadFrequently: false, alpha: true }),
 
     toolPencil: document.getElementById('tool-pencil'),
     toolEraser: document.getElementById('tool-eraser'),
@@ -461,9 +467,13 @@
     // preview zoom
     previewZoom: document.getElementById('previewZoom'),
     pzCanvas: document.getElementById('previewZoomCanvas'),
-    pzCtx: document.getElementById('previewZoomCanvas').getContext('2d'),
+    pzCtx: document.getElementById('previewZoomCanvas').getContext('2d', { willReadFrequently: false, alpha: true }),
     pzLabel: document.getElementById('previewZoomLabel'),
   };
+
+  // Force crisp rendering
+  el.ctx.imageSmoothingEnabled = false;
+  el.pzCtx.imageSmoothingEnabled = false;
 
   // ====== Utils / History ======
   const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2));
@@ -581,7 +591,12 @@
   function drawImageURLToCanvas(url, ctx) {
     return new Promise((resolve, reject) => {
       const img = new Image();
-      img.onload = () => { ctx.clearRect(0,0,ctx.canvas.width, ctx.canvas.height); ctx.drawImage(img, 0, 0); resolve(); };
+      img.onload = () => { 
+        ctx.clearRect(0,0,ctx.canvas.width, ctx.canvas.height); 
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(img, 0, 0); 
+        resolve(); 
+      };
       img.onerror = reject;
       img.src = url;
     });
@@ -610,7 +625,7 @@
     const off = document.createElement('canvas');
     off.width = state.cols;
     off.height = state.rows;
-    const offCtx = off.getContext('2d', { willReadFrequently: false });
+    const offCtx = off.getContext('2d', { willReadFrequently: false, alpha: true });
     offCtx.imageSmoothingEnabled = false;
     return { id: uid(), name: name || `Layer ${state.layers.length + 1}`, visible: true, locked: false, off, offCtx, preview: null };
   }
@@ -684,6 +699,45 @@
     autosaveMaybe();
   }
 
+  // ====== Canvas Resize (preserving content) ======
+  function resizeCanvas(newCols, newRows) {
+    const oldCols = state.cols;
+    const oldRows = state.rows;
+    
+    if (oldCols === newCols && oldRows === newRows) return;
+
+    pushHistory('resizeCanvas');
+
+    state.cols = newCols;
+    state.rows = newRows;
+
+    // Resize each layer preserving content
+    for (const layer of state.layers) {
+      // Save current content
+      const oldCanvas = document.createElement('canvas');
+      oldCanvas.width = oldCols;
+      oldCanvas.height = oldRows;
+      const oldCtx = oldCanvas.getContext('2d', { willReadFrequently: false, alpha: true });
+      oldCtx.imageSmoothingEnabled = false;
+      oldCtx.drawImage(layer.off, 0, 0);
+
+      // Resize layer canvas
+      layer.off.width = newCols;
+      layer.off.height = newRows;
+      layer.offCtx.imageSmoothingEnabled = false;
+
+      // Copy back (will clip or show transparent areas as needed)
+      const copyWidth = Math.min(oldCols, newCols);
+      const copyHeight = Math.min(oldRows, newRows);
+      layer.offCtx.drawImage(oldCanvas, 0, 0, copyWidth, copyHeight, 0, 0, copyWidth, copyHeight);
+    }
+
+    renderLayersPanel();
+    draw();
+    autosaveMaybe();
+    setStatus(`Canvas resized to ${newCols}×${newRows}`);
+  }
+
   // ====== View sizing ======
   function resizeViewCanvas() {
     const rect = el.wrap.getBoundingClientRect();
@@ -728,6 +782,7 @@
       ctx.fillStyle = state.bgColor; ctx.fillRect(dx, dy, dw, dh);
     }
 
+    ctx.imageSmoothingEnabled = false;
     for (const layer of state.layers) {
       if (!layer.visible) continue;
       ctx.globalAlpha = layer.locked ? 0.95 : 1;
@@ -1026,7 +1081,7 @@
     for (const layer of state.layers) {
       if (!layer.preview) continue;
       const p = layer.preview;
-      const pctx = p.getContext('2d');
+      const pctx = p.getContext('2d', { willReadFrequently: false, alpha: true });
       pctx.imageSmoothingEnabled = false;
 
       if (state.transparentBG) {
@@ -1149,7 +1204,7 @@
     localStorage.setItem(LS_KEY, JSON.stringify(store));
   }
 
-  // ====== Export PNG ======
+  // ====== Export PNG (pixel-perfect) ======
   function exportPNG(ev) {
     let scale = 1;
     if (ev && ev.shiftKey) {
@@ -1160,7 +1215,7 @@
     const out = document.createElement('canvas');
     out.width = state.cols * scale;
     out.height = state.rows * scale;
-    const octx = out.getContext('2d', { willReadFrequently: false });
+    const octx = out.getContext('2d', { willReadFrequently: false, alpha: true });
     octx.imageSmoothingEnabled = false;
 
     if (!state.transparentBG) {
@@ -1175,12 +1230,12 @@
 
     out.toBlob((blob) => {
       const a = document.createElement('a');
-      const name = (state.projectName || 'pixel-art') + '.png';
+      const name = (state.projectName || 'pixel-art') + (scale > 1 ? `_${scale}x` : '') + '.png';
       a.href = URL.createObjectURL(blob);
       a.download = name;
       a.click();
       URL.revokeObjectURL(a.href);
-      setStatus(`Exported ${name}`);
+      setStatus(`Exported ${name} (${out.width}×${out.height}px)`);
     }, 'image/png');
   }
 
@@ -1268,10 +1323,7 @@
       const cols = clamp(parseInt(el.cols.value, 10), 4, 512);
       const rows = clamp(parseInt(el.rows.value, 10), 4, 512);
       if (cols === state.cols && rows === state.rows) return;
-      if (!confirm('Apply new size? This creates a new blank canvas (save first if needed).')) return;
-      pushHistory('resizeCanvas');
-      initProject(cols, rows);
-      setStatus('Canvas resized');
+      resizeCanvas(cols, rows);
     });
     el.centerView.addEventListener('click', () => { centerAndFit(); draw(); });
 
