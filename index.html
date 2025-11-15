@@ -99,6 +99,8 @@
     touch-action: none; 
     user-select: none;
   }
+  canvas#view.selecting { cursor: crosshair; }
+  canvas#view.moving { cursor: move; }
 
   .right { 
     display: grid;
@@ -282,7 +284,7 @@
 </head>
 <body>
   <header>
-    <div class="title">🧩 Pixel Art — By BigStrib</div>
+    <div class="title">🧩 Pixel Art — Made By:BigStrib</div>
 
     <div class="row">
       <span class="tag">Project</span>
@@ -311,6 +313,7 @@
       <div class="toolbar">
         <div class="tools">
           <button id="tool-pencil" class="active" title="Pencil (P)">✏️</button>
+          <button id="tool-select" title="Select & Move (S)">⬚</button>
           <button id="tool-eraser" title="Eraser (E)">🧽</button>
           <button id="tool-eyedropper" title="Eyedropper (I)">🎯</button>
         </div>
@@ -350,7 +353,7 @@
       <div class="panel">
         <div class="panel-head">
           <span class="tag">Canvas</span>
-          <span class="hint small"></span>
+          <span class="hint small">Resizes preserving content</span>
         </div>
         <div class="row" style="margin-top:8px">
           <input id="cols" type="number" min="4" max="512" value="32" />
@@ -372,7 +375,8 @@
       <div class="footer small">
         <span>
           Wheel to zoom. Left-drag or click to paint. Right-drag to erase. Middle-drag or hold <span class="kbd">Space</span> to pan.
-          Tools: <span class="kbd">P</span>/<span class="kbd">E</span>/<span class="kbd">I</span>. Press <span class="kbd">0</span> to reset/fit.
+          Tools: <span class="kbd">P</span>/<span class="kbd">S</span>/<span class="kbd">E</span>/<span class="kbd">I</span>. Press <span class="kbd">0</span> to reset/fit.
+          Select tool: drag to select, then drag to move. <span class="kbd">Enter</span> to commit, <span class="kbd">Esc</span> to cancel.
         </span>
       </div>
     </div>
@@ -413,6 +417,10 @@
     history: [], future: [], historyLimit: 50,
     // click fallback guard (fix double-undo on first stroke)
     hadPointerDown: false,
+    // selection
+    selection: null, // { x1, y1, x2, y2, data (ImageData), moving, offsetX, offsetY }
+    selecting: false,
+    selectStart: null,
   };
 
   // ====== Elements ======
@@ -422,6 +430,7 @@
     ctx: document.getElementById('view').getContext('2d', { willReadFrequently: false, alpha: true }),
 
     toolPencil: document.getElementById('tool-pencil'),
+    toolSelect: document.getElementById('tool-select'),
     toolEraser: document.getElementById('tool-eraser'),
     toolEyedropper: document.getElementById('tool-eyedropper'),
 
@@ -803,9 +812,200 @@
       ctx.stroke(); ctx.restore();
     }
 
+    // Draw selection
+    if (state.selection) {
+      const sel = state.selection;
+      const x = sel.moving ? sel.x1 + sel.offsetX : sel.x1;
+      const y = sel.moving ? sel.y1 + sel.offsetY : sel.y1;
+      const w = sel.x2 - sel.x1 + 1;
+      const h = sel.y2 - sel.y1 + 1;
+
+      const px = Math.round(dx + x * s);
+      const py = Math.round(dy + y * s);
+      const pw = Math.round(w * s);
+      const ph = Math.round(h * s);
+
+      // Draw selected content if moving
+      if (sel.moving && sel.data) {
+        ctx.save();
+        ctx.imageSmoothingEnabled = false;
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = w;
+        tempCanvas.height = h;
+        const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: false, alpha: true });
+        tempCtx.imageSmoothingEnabled = false;
+        tempCtx.putImageData(sel.data, 0, 0);
+        ctx.drawImage(tempCanvas, px, py, pw, ph);
+        ctx.restore();
+      }
+
+      // Draw selection outline
+      ctx.save();
+      ctx.strokeStyle = '#6aa3ff';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.strokeRect(px + 1, py + 1, pw - 2, ph - 2);
+      ctx.restore();
+    }
+
     ctx.save(); ctx.strokeStyle = '#6aa3ff'; ctx.lineWidth = 2; ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh); ctx.restore();
 
     updateAllLayerPreviews();
+  }
+
+  // ====== Selection helpers ======
+  function startSelection(x, y) {
+    if (!inBounds(x, y)) return;
+    state.selecting = true;
+    state.selectStart = { x, y };
+    state.selection = null;
+  }
+
+  function updateSelection(x, y) {
+    if (!state.selecting || !state.selectStart) return;
+    const x1 = Math.min(state.selectStart.x, x);
+    const y1 = Math.min(state.selectStart.y, y);
+    const x2 = Math.max(state.selectStart.x, x);
+    const y2 = Math.max(state.selectStart.y, y);
+    
+    state.selection = { x1, y1, x2, y2, data: null, moving: false, offsetX: 0, offsetY: 0 };
+    draw();
+  }
+
+  function finalizeSelection() {
+    state.selecting = false;
+    state.selectStart = null;
+    if (state.selection) {
+      const sel = state.selection;
+      const w = sel.x2 - sel.x1 + 1;
+      const h = sel.y2 - sel.y1 + 1;
+      
+      // Capture the selected area from active layer
+      const layer = getActiveLayer();
+      if (layer && !layer.locked) {
+        sel.data = layer.offCtx.getImageData(sel.x1, sel.y1, w, h);
+        setStatus(`Selected ${w}×${h} area`);
+      }
+    }
+    draw();
+  }
+
+  function isInsideSelection(x, y) {
+    if (!state.selection) return false;
+    const sel = state.selection;
+    const sx = sel.moving ? sel.x1 + sel.offsetX : sel.x1;
+    const sy = sel.moving ? sel.y1 + sel.offsetY : sel.y1;
+    const w = sel.x2 - sel.x1 + 1;
+    const h = sel.y2 - sel.y1 + 1;
+    return x >= sx && x < sx + w && y >= sy && y < sy + h;
+  }
+
+  function startMovingSelection(startX, startY) {
+    if (!state.selection || !state.selection.data) return;
+    state.selection.moving = true;
+    state.selection.moveStartX = startX;
+    state.selection.moveStartY = startY;
+    state.selection.moveStartOffsetX = state.selection.offsetX;
+    state.selection.moveStartOffsetY = state.selection.offsetY;
+    
+    // Clear the original area
+    const layer = getActiveLayer();
+    if (layer && !layer.locked) {
+      const sel = state.selection;
+      const w = sel.x2 - sel.x1 + 1;
+      const h = sel.y2 - sel.y1 + 1;
+      layer.offCtx.clearRect(sel.x1, sel.y1, w, h);
+    }
+    
+    el.canvas.classList.add('moving');
+    draw();
+  }
+
+  function moveSelection(x, y) {
+    if (!state.selection || !state.selection.moving) return;
+    const sel = state.selection;
+    const dx = x - sel.moveStartX;
+    const dy = y - sel.moveStartY;
+    sel.offsetX = sel.moveStartOffsetX + dx;
+    sel.offsetY = sel.moveStartOffsetY + dy;
+    draw();
+  }
+
+  function commitSelection() {
+    if (!state.selection || !state.selection.data) {
+      state.selection = null;
+      draw();
+      return;
+    }
+
+    const layer = getActiveLayer();
+    if (!layer || layer.locked) {
+      setStatus('Layer is locked 🔒');
+      cancelSelection();
+      return;
+    }
+
+    pushHistory('moveSelection');
+
+    const sel = state.selection;
+    const w = sel.x2 - sel.x1 + 1;
+    const h = sel.y2 - sel.y1 + 1;
+    const finalX = sel.x1 + sel.offsetX;
+    const finalY = sel.y1 + sel.offsetY;
+
+    // Put the data at the new position
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = w;
+    tempCanvas.height = h;
+    const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: false, alpha: true });
+    tempCtx.imageSmoothingEnabled = false;
+    tempCtx.putImageData(sel.data, 0, 0);
+
+    // Clip to canvas bounds
+    const clipX = Math.max(0, finalX);
+    const clipY = Math.max(0, finalY);
+    const clipW = Math.min(w, state.cols - clipX, w - (clipX - finalX));
+    const clipH = Math.min(h, state.rows - clipY, h - (clipY - finalY));
+    
+    if (clipW > 0 && clipH > 0) {
+      const srcX = clipX - finalX;
+      const srcY = clipY - finalY;
+      layer.offCtx.drawImage(tempCanvas, srcX, srcY, clipW, clipH, clipX, clipY, clipW, clipH);
+    }
+
+    state.selection = null;
+    el.canvas.classList.remove('moving', 'selecting');
+    draw();
+    autosaveMaybe();
+    setStatus('Selection moved');
+  }
+
+  function cancelSelection() {
+    if (!state.selection) return;
+
+    // If we were moving, restore the original position
+    if (state.selection.moving && state.selection.data) {
+      const layer = getActiveLayer();
+      if (layer && !layer.locked) {
+        const sel = state.selection;
+        const w = sel.x2 - sel.x1 + 1;
+        const h = sel.y2 - sel.y1 + 1;
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = w;
+        tempCanvas.height = h;
+        const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: false, alpha: true });
+        tempCtx.imageSmoothingEnabled = false;
+        tempCtx.putImageData(sel.data, 0, 0);
+        layer.offCtx.drawImage(tempCanvas, 0, 0, w, h, sel.x1, sel.y1, w, h);
+      }
+    }
+
+    state.selection = null;
+    state.selecting = false;
+    state.selectStart = null;
+    el.canvas.classList.remove('moving', 'selecting');
+    draw();
+    setStatus('Selection cancelled');
   }
 
   // ====== Painting / Sampling ======
@@ -1258,6 +1458,7 @@
 
     // Tools
     el.toolPencil.addEventListener('click', () => setTool('pencil'));
+    el.toolSelect.addEventListener('click', () => setTool('select'));
     el.toolEraser.addEventListener('click', () => setTool('eraser'));
     el.toolEyedropper.addEventListener('click', () => setTool('eyedropper'));
 
@@ -1284,8 +1485,15 @@
         return;
       }
 
+      // Selection commit/cancel
+      if (state.tool === 'select' && state.selection) {
+        if (e.key === 'Enter') { e.preventDefault(); commitSelection(); return; }
+        if (e.key === 'Escape') { e.preventDefault(); cancelSelection(); return; }
+      }
+
       if (e.code === 'Space') { state.spaceHeld = true; el.canvas.classList.add('grabbing'); e.preventDefault(); }
       if (e.key === 'p' || e.key === 'P') setTool('pencil');
+      if (e.key === 's' || e.key === 'S') setTool('select');
       if (e.key === 'e' || e.key === 'E') setTool('eraser');
       if (e.key === 'i' || e.key === 'I') setTool('eyedropper');
       if (e.key === '0') { centerAndFit(); draw(); }
@@ -1330,11 +1538,30 @@
     // Layers
     el.addLayer.addEventListener('click', () => addLayer());
 
-    // Canvas pointer (paint/erase/pan) + history per stroke
+    // Canvas pointer (paint/erase/pan/select)
     el.canvas.addEventListener('pointerdown', (ev) => {
-      state.hadPointerDown = true; // guard to avoid duplicate click fallback
+      state.hadPointerDown = true;
 
       if (ev.button === 1 || state.spaceHeld) { startPan(ev); return; }
+
+      const { x, y } = worldCellFromEvent(ev);
+
+      // SELECT TOOL
+      if (state.tool === 'select' && ev.button === 0) {
+        // If clicking inside existing selection, start moving
+        if (state.selection && !state.selecting && isInsideSelection(x, y)) {
+          pushHistory('moveSelection');
+          startMovingSelection(x, y);
+          el.canvas.setPointerCapture(ev.pointerId);
+        } else {
+          // Start new selection
+          cancelSelection();
+          startSelection(x, y);
+          el.canvas.setPointerCapture(ev.pointerId);
+          el.canvas.classList.add('selecting');
+        }
+        return;
+      }
 
       // Prepare history for painting/erasing strokes (once per stroke)
       if ((ev.button === 0 && (state.tool === 'pencil' || state.tool === 'eraser')) || ev.button === 2) {
@@ -1346,7 +1573,7 @@
       if (ev.button === 2) {
         el.canvas.setPointerCapture(ev.pointerId);
         state.isDrawing = true; state.dragErase = true;
-        const { x, y } = worldCellFromEvent(ev); state.lastCell = `${x},${y}`;
+        state.lastCell = `${x},${y}`;
         paintAt(x, y, 'erase'); return;
       }
 
@@ -1354,7 +1581,7 @@
       if (ev.button === 0) {
         el.canvas.setPointerCapture(ev.pointerId);
         state.isDrawing = true; state.dragErase = false;
-        const { x, y } = worldCellFromEvent(ev); state.lastCell = `${x},${y}`;
+        state.lastCell = `${x},${y}`;
         paintAt(x, y, null);
       }
     });
@@ -1364,6 +1591,25 @@
       if (inBounds(x,y)) el.coords.textContent = `x: ${x}, y: ${y}`; else el.coords.textContent = `x: -, y: -`;
 
       if (state.isPanning) { movePan(ev); return; }
+
+      // Selection interactions
+      if (state.tool === 'select') {
+        if (state.selecting) {
+          updateSelection(x, y);
+          return;
+        }
+        if (state.selection && state.selection.moving) {
+          moveSelection(x, y);
+          return;
+        }
+        // Update cursor
+        if (state.selection && isInsideSelection(x, y)) {
+          el.canvas.style.cursor = 'move';
+        } else {
+          el.canvas.style.cursor = 'crosshair';
+        }
+      }
+
       if (!state.isDrawing) return;
       const key = `${x},${y}`;
       if (key !== state.lastCell) {
@@ -1371,10 +1617,19 @@
         paintAt(x, y, state.dragErase ? 'erase' : null);
       }
     });
+
     const stopDraw = () => {
+      if (state.selecting) {
+        finalizeSelection();
+        el.canvas.classList.remove('selecting');
+      }
+      if (state.selection && state.selection.moving) {
+        commitSelection();
+      }
       state.isDrawing = false; state.dragErase = false; state.lastCell = null;
       setTimeout(() => { state.hadPointerDown = false; }, 0);
     };
+
     el.canvas.addEventListener('pointerup', (ev) => { if (state.isPanning) endPan(); else stopDraw(); });
     el.canvas.addEventListener('pointercancel', () => { if (state.isPanning) endPan(); else stopDraw(); });
     el.canvas.addEventListener('pointerleave', () => { if (state.isPanning) endPan(); else stopDraw(); });
@@ -1382,7 +1637,7 @@
     // Click fallback: only if no pointerdown handled this interaction
     el.canvas.addEventListener('click', (ev) => {
       if (state.isPanning) return;
-      if (state.hadPointerDown) return; // pointer flow already handled it
+      if (state.hadPointerDown) return;
 
       if (state.tool === 'pencil' || state.tool === 'eraser') {
         const layer = getActiveLayer();
@@ -1420,9 +1675,15 @@
 
   // ====== Tools / Palette ======
   function setTool(tool) {
+    // Cancel any active selection when switching tools
+    if (state.tool === 'select' && tool !== 'select') {
+      cancelSelection();
+    }
+
     state.tool = tool;
-    for (const b of [el.toolPencil, el.toolEraser, el.toolEyedropper]) b.classList.remove('active');
+    for (const b of [el.toolPencil, el.toolSelect, el.toolEraser, el.toolEyedropper]) b.classList.remove('active');
     if (tool === 'pencil') el.toolPencil.classList.add('active');
+    if (tool === 'select') el.toolSelect.classList.add('active');
     if (tool === 'eraser') el.toolEraser.classList.add('active');
     if (tool === 'eyedropper') el.toolEyedropper.classList.add('active');
   }
@@ -1487,6 +1748,9 @@
     state.cols = cols;
     state.rows = rows;
     state.layers = [];
+    state.selection = null;
+    state.selecting = false;
+    state.selectStart = null;
     addLayer('Layer 1');
     ensureActiveLayer();
     renderLayersPanel();
@@ -1521,3 +1785,4 @@
 </script>
 </body>
 </html>
+
